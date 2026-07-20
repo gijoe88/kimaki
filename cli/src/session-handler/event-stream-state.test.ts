@@ -9,9 +9,13 @@ import { type OpencodeEventLogEntry } from './opencode-session-event-log.js'
 import {
   derivePendingPermissionRequests,
   getAssistantMessageIdsForLatestUserTurn,
+  getDerivedDescendantSessions,
   getDerivedSubagentSessions,
   getEventBufferSessionId,
   getCurrentTurnStartTime,
+  getDerivedSubtaskAgentType,
+  getDerivedSubtaskChain,
+  getDerivedSubtaskChainLabels,
   getDerivedSubtaskIndex,
   getLatestAssistantMessageIdForLatestUserTurn,
   getLatestRunInfo,
@@ -832,5 +836,614 @@ describe('real-session-footer-suppressed-on-pre-idle-interrupt', () => {
       sessionId,
       messageId: latestAssistantId,
     })).toBe(true)
+  })
+})
+
+// Depth-3 fixture for the graph-aware chain derivation.
+//
+// Topology (hand-built):
+//   ses_ROOT (mainSessionId)
+//     └─ task → ses_PM        (project-manager, child 1 of msg_ROOT_asst)
+//          ├─ task → ses_INV2  (investigate,  child 1 of msg_PM_asst)
+//          └─ task → ses_INV   (investigate,  child 2 of msg_PM_asst) ← leaf
+//               └─ read /home/kimaki/.local/foo → permission.asked on ses_INV
+//
+// The ses_INV2 sibling exists only to verify per-hop indexing is scoped to the
+// PARENT assistant message: ses_INV must be `investigate-2`, not
+// `investigate-1`, even though it's the only "investigate" child of ses_ROOT.
+describe('real-session-nested-task-permission', () => {
+  const events = loadFixture('real-session-nested-task-permission.jsonl')
+  const mainSessionId = 'ses_ROOT'
+
+  test('getDerivedSubtaskChain returns the full root→leaf chain for the depth-2 leaf', () => {
+    expect(getDerivedSubtaskChain({
+      events,
+      mainSessionId,
+      candidateSessionId: 'ses_INV',
+    })).toMatchInlineSnapshot(`
+      [
+        "ses_ROOT",
+        "ses_PM",
+        "ses_INV",
+      ]
+    `)
+  })
+
+  test('getDerivedSubtaskChain returns the root→depth-1 chain for a direct child', () => {
+    expect(getDerivedSubtaskChain({
+      events,
+      mainSessionId,
+      candidateSessionId: 'ses_PM',
+    })).toMatchInlineSnapshot(`
+      [
+        "ses_ROOT",
+        "ses_PM",
+      ]
+    `)
+  })
+
+  test('getDerivedSubtaskChain returns a single-element chain when candidate === main', () => {
+    expect(getDerivedSubtaskChain({
+      events,
+      mainSessionId,
+      candidateSessionId: 'ses_ROOT',
+    })).toMatchInlineSnapshot(`
+      [
+        "ses_ROOT",
+      ]
+    `)
+  })
+
+  test('getDerivedSubtaskChain returns undefined for a session not in the graph', () => {
+    expect(getDerivedSubtaskChain({
+      events,
+      mainSessionId,
+      candidateSessionId: 'ses_nonexistent',
+    })).toBe(undefined)
+  })
+
+  test('getDerivedSubtaskChainLabels returns root + per-hop labels with correct per-parent indices', () => {
+    // ses_PM is the only child of msg_ROOT_asst  → index 1 → "project-manager-1"
+    // ses_INV is the SECOND child of msg_PM_asst → index 2 → "investigate-2"
+    // (ses_INV2 was emitted first under msg_PM_asst, so it claims index 1.)
+    expect(getDerivedSubtaskChainLabels({
+      events,
+      mainSessionId,
+      candidateSessionId: 'ses_INV',
+    })).toMatchInlineSnapshot(`
+      [
+        {
+          "label": "",
+          "sessionId": "ses_ROOT",
+        },
+        {
+          "label": "project-manager-1",
+          "sessionId": "ses_PM",
+          "subagentType": "project-manager",
+        },
+        {
+          "label": "investigate-2",
+          "sessionId": "ses_INV",
+          "subagentType": "investigate",
+        },
+      ]
+    `)
+  })
+
+  test('getDerivedSubtaskChainLabels returns root + depth-1 label for a direct child', () => {
+    expect(getDerivedSubtaskChainLabels({
+      events,
+      mainSessionId,
+      candidateSessionId: 'ses_PM',
+    })).toMatchInlineSnapshot(`
+      [
+        {
+          "label": "",
+          "sessionId": "ses_ROOT",
+        },
+        {
+          "label": "project-manager-1",
+          "sessionId": "ses_PM",
+          "subagentType": "project-manager",
+        },
+      ]
+    `)
+  })
+
+  test('compaction-safe: real compaction preserves state.input.subagent_type for task tools', () => {
+    // Mirror the actual compaction behavior in
+    // thread-session-runtime.ts compactEventForEventBuffer:
+    //   - tool parts: state.input = {} (always)
+    //   - task tools: state.input.subagent_type is restored from the original
+    //   - state.metadata is untouched (so metadata.sessionId survives)
+    // After this transform the chain must still resolve and the labels must
+    // stay identical (subagent_type survives).
+    const compactedEvents: EventBufferEntry[] = events.map((entry) => {
+      const event = entry.event
+      if (event.type !== 'message.part.updated') {
+        return entry
+      }
+      const part = event.properties.part
+      if (part.type !== 'tool') {
+        return entry
+      }
+      const cloned = structuredClone(event)
+      const clonedPart = cloned.properties.part
+      if (clonedPart.type !== 'tool') {
+        return entry
+      }
+      const state = clonedPart.state
+      const preservedSubagentType =
+        clonedPart.tool === 'task'
+          ? state.input?.subagent_type
+          : undefined
+      state.input = {}
+      if (typeof preservedSubagentType === 'string') {
+        state.input.subagent_type = preservedSubagentType
+      }
+      return { ...entry, event: cloned }
+    })
+
+    expect(getDerivedSubtaskChain({
+      events: compactedEvents,
+      mainSessionId,
+      candidateSessionId: 'ses_INV',
+    })).toMatchInlineSnapshot(`
+      [
+        "ses_ROOT",
+        "ses_PM",
+        "ses_INV",
+      ]
+    `)
+
+    // Labels are unchanged because real compaction preserves subagent_type.
+    expect(getDerivedSubtaskChainLabels({
+      events: compactedEvents,
+      mainSessionId,
+      candidateSessionId: 'ses_INV',
+    })).toMatchInlineSnapshot(`
+      [
+        {
+          "label": "",
+          "sessionId": "ses_ROOT",
+        },
+        {
+          "label": "project-manager-1",
+          "sessionId": "ses_PM",
+          "subagentType": "project-manager",
+        },
+        {
+          "label": "investigate-2",
+          "sessionId": "ses_INV",
+          "subagentType": "investigate",
+        },
+      ]
+    `)
+  })
+
+  test('compaction defense-in-depth: a hypothetical full strip of subagent_type degrades labels to task-N', () => {
+    // If a future compaction change ever drops subagent_type for task tools,
+    // labels must degrade gracefully to `task-${index}` rather than crashing.
+    // The chain itself must still resolve (it reads metadata.sessionId, not
+    // input). This test documents the expected fallback shape.
+    const strippedEvents: EventBufferEntry[] = events.map((entry) => {
+      const event = entry.event
+      if (event.type !== 'message.part.updated') {
+        return entry
+      }
+      const part = event.properties.part
+      if (part.type !== 'tool' || part.tool !== 'task') {
+        return entry
+      }
+      const cloned = structuredClone(event)
+      const clonedPart = cloned.properties.part
+      if (clonedPart.type !== 'tool' || clonedPart.tool !== 'task') {
+        return entry
+      }
+      // Aggressive strip: wipe the entire input AND any metadata subagent hint.
+      clonedPart.state.input = {}
+      return { ...entry, event: cloned }
+    })
+
+    expect(getDerivedSubtaskChain({
+      events: strippedEvents,
+      mainSessionId,
+      candidateSessionId: 'ses_INV',
+    })).toMatchInlineSnapshot(`
+      [
+        "ses_ROOT",
+        "ses_PM",
+        "ses_INV",
+      ]
+    `)
+
+    expect(getDerivedSubtaskChainLabels({
+      events: strippedEvents,
+      mainSessionId,
+      candidateSessionId: 'ses_INV',
+    })).toMatchInlineSnapshot(`
+      [
+        {
+          "label": "",
+          "sessionId": "ses_ROOT",
+        },
+        {
+          "label": "task-1",
+          "sessionId": "ses_PM",
+          "subagentType": undefined,
+        },
+        {
+          "label": "task-2",
+          "sessionId": "ses_INV",
+          "subagentType": undefined,
+        },
+      ]
+    `)
+  })
+
+  test('depth-1 backward compat: getDerivedSubtaskIndex sees direct children but not depth-2 leaves', () => {
+    // ses_PM is a direct child of ses_ROOT → index 1.
+    expect(getDerivedSubtaskIndex({
+      events,
+      mainSessionId,
+      candidateSessionId: 'ses_PM',
+    })).toBe(1)
+
+    // ses_INV is a depth-2 leaf (child of ses_PM, not ses_ROOT). The depth-1
+    // shortcut must NOT see it — that's why the chain walker exists.
+    expect(getDerivedSubtaskIndex({
+      events,
+      mainSessionId,
+      candidateSessionId: 'ses_INV',
+    })).toBe(undefined)
+  })
+
+  test('depth-1 backward compat: getDerivedSubtaskAgentType only resolves direct children', () => {
+    expect(getDerivedSubtaskAgentType({
+      events,
+      mainSessionId,
+      candidateSessionId: 'ses_PM',
+    })).toBe('project-manager')
+
+    // Depth-2 leaf is invisible to the depth-1 shortcut.
+    expect(getDerivedSubtaskAgentType({
+      events,
+      mainSessionId,
+      candidateSessionId: 'ses_INV',
+    })).toBe(undefined)
+  })
+
+  test('depth-1 backward compat: getDerivedSubagentSessions lists only direct children of main', () => {
+    expect(getDerivedSubagentSessions({
+      events,
+      mainSessionId,
+    })).toMatchInlineSnapshot(`
+      [
+        {
+          "childSessionId": "ses_PM",
+          "description": "manage the work",
+          "subagentType": "project-manager",
+          "timestamp": 1005,
+        },
+      ]
+    `)
+  })
+
+  test('cycle safety: cyclic parent edges terminate and return undefined', () => {
+    // Build a disconnected cycle ses_A ↔ ses_B by cloning a real task edge
+    // from the fixture and repointing parent/child session ids. Neither node
+    // is reachable from ses_ROOT, so the chain walker must return undefined.
+    // Without cycle detection (the visited set in getDerivedSubtaskChain) the
+    // walker would loop A→B→A→B→... forever and the test would time out.
+    const taskEntry = events.find((entry) => {
+      if (entry.event.type !== 'message.part.updated') {
+        return false
+      }
+      const part = entry.event.properties.part
+      return part.type === 'tool' && part.tool === 'task' && part.state.status === 'running'
+    })
+    if (!taskEntry || taskEntry.event.type !== 'message.part.updated') {
+      throw new Error('Expected task event in fixture')
+    }
+
+    // Edge 1: ses_A → task → ses_B
+    const edgeAToB = structuredClone(taskEntry)
+    if (edgeAToB.event.type !== 'message.part.updated') {
+      throw new Error('Expected message.part.updated')
+    }
+    {
+      const part = edgeAToB.event.properties.part
+      if (part.type !== 'tool' || part.tool !== 'task') {
+        throw new Error('Expected task tool part')
+      }
+      if (part.state.status !== 'running') {
+        throw new Error('Expected running task tool part')
+      }
+      part.id = 'prt_cycle_A_to_B'
+      part.callID = 'call_cycle_A_to_B'
+      part.messageID = 'msg_cycle_A_asst'
+      part.sessionID = 'ses_A'
+      edgeAToB.event.properties.sessionID = 'ses_A'
+      part.state = {
+        ...part.state,
+        metadata: {
+          ...(part.state.metadata || {}),
+          sessionId: 'ses_B',
+        },
+      }
+      edgeAToB.timestamp = 1
+    }
+
+    // Edge 2: ses_B → task → ses_A  (closes the cycle)
+    const edgeBToA = structuredClone(taskEntry)
+    if (edgeBToA.event.type !== 'message.part.updated') {
+      throw new Error('Expected message.part.updated')
+    }
+    {
+      const part = edgeBToA.event.properties.part
+      if (part.type !== 'tool' || part.tool !== 'task') {
+        throw new Error('Expected task tool part')
+      }
+      if (part.state.status !== 'running') {
+        throw new Error('Expected running task tool part')
+      }
+      part.id = 'prt_cycle_B_to_A'
+      part.callID = 'call_cycle_B_to_A'
+      part.messageID = 'msg_cycle_B_asst'
+      part.sessionID = 'ses_B'
+      edgeBToA.event.properties.sessionID = 'ses_B'
+      part.state = {
+        ...part.state,
+        metadata: {
+          ...(part.state.metadata || {}),
+          sessionId: 'ses_A',
+        },
+      }
+      edgeBToA.timestamp = 2
+    }
+
+    const cyclicEvents: EventBufferEntry[] = [edgeAToB, edgeBToA]
+
+    expect(getDerivedSubtaskChain({
+      events: cyclicEvents,
+      mainSessionId: 'ses_ROOT',
+      candidateSessionId: 'ses_A',
+    })).toBe(undefined)
+  })
+
+  test('upToIndex honored: truncating before the ses_PM→ses_INV edge drops ses_INV', () => {
+    // Locate the ses_PM → ses_INV task edge in the fixture.
+    const invEdgeIndex = events.findIndex((entry) => {
+      if (entry.event.type !== 'message.part.updated') {
+        return false
+      }
+      const part = entry.event.properties.part
+      if (part.type !== 'tool' || part.tool !== 'task') {
+        return false
+      }
+      if (part.sessionID !== 'ses_PM') {
+        return false
+      }
+      const metadata = (part.state as { metadata?: { sessionId?: string } }).metadata
+      return metadata?.sessionId === 'ses_INV'
+    })
+    expect(invEdgeIndex).toBeGreaterThan(0)
+
+    // Truncating just before the edge excludes ses_INV from the graph.
+    expect(getDerivedSubtaskChain({
+      events,
+      mainSessionId,
+      candidateSessionId: 'ses_INV',
+      upToIndex: invEdgeIndex - 1,
+    })).toBe(undefined)
+
+    // Including the edge index resolves the full chain.
+    expect(getDerivedSubtaskChain({
+      events,
+      mainSessionId,
+      candidateSessionId: 'ses_INV',
+      upToIndex: invEdgeIndex,
+    })).toEqual(['ses_ROOT', 'ses_PM', 'ses_INV'])
+
+    // Labels also respect the truncation: undefined when the edge is dropped.
+    expect(getDerivedSubtaskChainLabels({
+      events,
+      mainSessionId,
+      candidateSessionId: 'ses_INV',
+      upToIndex: invEdgeIndex - 1,
+    })).toBe(undefined)
+  })
+
+  test('getDerivedSubtaskChain returns undefined for empty events when candidate !== main', () => {
+    expect(getDerivedSubtaskChain({
+      events: [],
+      mainSessionId: 'ses_ROOT',
+      candidateSessionId: 'ses_other',
+    })).toBe(undefined)
+
+    // Self-chain still resolves even with empty events — it short-circuits
+    // before the graph walk.
+    expect(getDerivedSubtaskChain({
+      events: [],
+      mainSessionId: 'ses_ROOT',
+      candidateSessionId: 'ses_ROOT',
+    })).toEqual(['ses_ROOT'])
+  })
+
+  test('getDerivedDescendantSessions returns all descendants of ses_ROOT (any depth)', () => {
+    // Graph: ses_ROOT → ses_PM → {ses_INV, ses_INV2}
+    // Descendants of ses_ROOT = [ses_PM, ses_INV, ses_INV2] in any order.
+    expect(
+      getDerivedDescendantSessions({
+        events,
+        mainSessionId,
+      }).sort(),
+    ).toEqual(['ses_INV', 'ses_INV2', 'ses_PM'])
+  })
+
+  test('getDerivedDescendantSessions returns depth-2 descendants when rooted at ses_PM', () => {
+    expect(
+      getDerivedDescendantSessions({
+        events,
+        mainSessionId: 'ses_PM',
+      }).sort(),
+    ).toEqual(['ses_INV', 'ses_INV2'])
+  })
+
+  test('getDerivedDescendantSessions returns [] for a leaf session', () => {
+    // ses_INV has no task children.
+    expect(
+      getDerivedDescendantSessions({
+        events,
+        mainSessionId: 'ses_INV',
+      }),
+    ).toEqual([])
+  })
+
+  test('getDerivedDescendantSessions returns [] for a session not in the graph', () => {
+    expect(
+      getDerivedDescendantSessions({
+        events,
+        mainSessionId: 'ses_nonexistent',
+      }),
+    ).toEqual([])
+  })
+
+  test('getDerivedDescendantSessions returns [] for mainSessionId with no children on empty events', () => {
+    expect(
+      getDerivedDescendantSessions({
+        events: [],
+        mainSessionId: 'ses_ROOT',
+      }),
+    ).toEqual([])
+  })
+
+  test('getDerivedDescendantSessions is cycle-safe: a disconnected cycle terminates', () => {
+    // Reuse the same cyclic fixture shape as the chain-walker cycle test:
+    // build ses_A ↔ ses_B and verify the BFS visited set prevents infinite
+    // loops. Descendants of ses_ROOT must exclude the cycle entirely (neither
+    // ses_A nor ses_B is reachable from ses_ROOT).
+    const taskEntry = events.find((entry) => {
+      if (entry.event.type !== 'message.part.updated') {
+        return false
+      }
+      const part = entry.event.properties.part
+      return part.type === 'tool' && part.tool === 'task' && part.state.status === 'running'
+    })
+    if (!taskEntry || taskEntry.event.type !== 'message.part.updated') {
+      throw new Error('Expected task event in fixture')
+    }
+
+    // Edge 1: ses_A → task → ses_B
+    const edgeAToB = structuredClone(taskEntry)
+    if (edgeAToB.event.type !== 'message.part.updated') {
+      throw new Error('Expected message.part.updated')
+    }
+    {
+      const part = edgeAToB.event.properties.part
+      if (part.type !== 'tool' || part.tool !== 'task') {
+        throw new Error('Expected task tool part')
+      }
+      if (part.state.status !== 'running') {
+        throw new Error('Expected running task tool part')
+      }
+      part.id = 'prt_desc_cycle_A_to_B'
+      part.callID = 'call_desc_cycle_A_to_B'
+      part.messageID = 'msg_desc_cycle_A_asst'
+      part.sessionID = 'ses_A'
+      edgeAToB.event.properties.sessionID = 'ses_A'
+      part.state = {
+        ...part.state,
+        metadata: {
+          ...(part.state.metadata || {}),
+          sessionId: 'ses_B',
+        },
+      }
+      edgeAToB.timestamp = 1
+    }
+
+    // Edge 2: ses_B → task → ses_A (closes the cycle)
+    const edgeBToA = structuredClone(taskEntry)
+    if (edgeBToA.event.type !== 'message.part.updated') {
+      throw new Error('Expected message.part.updated')
+    }
+    {
+      const part = edgeBToA.event.properties.part
+      if (part.type !== 'tool' || part.tool !== 'task') {
+        throw new Error('Expected task tool part')
+      }
+      if (part.state.status !== 'running') {
+        throw new Error('Expected running task tool part')
+      }
+      part.id = 'prt_desc_cycle_B_to_A'
+      part.callID = 'call_desc_cycle_B_to_A'
+      part.messageID = 'msg_desc_cycle_B_asst'
+      part.sessionID = 'ses_B'
+      edgeBToA.event.properties.sessionID = 'ses_B'
+      part.state = {
+        ...part.state,
+        metadata: {
+          ...(part.state.metadata || {}),
+          sessionId: 'ses_A',
+        },
+      }
+      edgeBToA.timestamp = 2
+    }
+
+    const cyclicEvents: EventBufferEntry[] = [edgeAToB, edgeBToA]
+
+    // ses_ROOT is not connected to the cycle, so it has no descendants here.
+    expect(
+      getDerivedDescendantSessions({
+        events: cyclicEvents,
+        mainSessionId: 'ses_ROOT',
+      }),
+    ).toEqual([])
+
+    // Starting from ses_A would visit ses_B then stop (ses_A already visited).
+    // Without cycle detection the BFS would loop A→B→A→B→... forever.
+    expect(
+      getDerivedDescendantSessions({
+        events: cyclicEvents,
+        mainSessionId: 'ses_A',
+      }).sort(),
+    ).toEqual(['ses_B'])
+  })
+
+  test('getDerivedDescendantSessions honors upToIndex', () => {
+    // Locate the ses_PM → ses_INV edge in the fixture.
+    const invEdgeIndex = events.findIndex((entry) => {
+      if (entry.event.type !== 'message.part.updated') {
+        return false
+      }
+      const part = entry.event.properties.part
+      if (part.type !== 'tool' || part.tool !== 'task') {
+        return false
+      }
+      if (part.sessionID !== 'ses_PM') {
+        return false
+      }
+      const metadata = (part.state as { metadata?: { sessionId?: string } }).metadata
+      return metadata?.sessionId === 'ses_INV'
+    })
+    expect(invEdgeIndex).toBeGreaterThan(0)
+
+    // Truncating just before the ses_PM→ses_INV edge drops both depth-2 leaves.
+    // (ses_INV2 is emitted earlier in the fixture, but we still drop ses_INV;
+    // to keep the assertion robust we only assert that ses_INV is absent.)
+    const beforeInv = getDerivedDescendantSessions({
+      events,
+      mainSessionId,
+      upToIndex: invEdgeIndex - 1,
+    })
+    expect(beforeInv).not.toContain('ses_INV')
+
+    // Including the edge index resolves every descendant.
+    const atInv = getDerivedDescendantSessions({
+      events,
+      mainSessionId,
+      upToIndex: invEdgeIndex,
+    }).sort()
+    expect(atInv).toEqual(['ses_INV', 'ses_INV2', 'ses_PM'])
   })
 })

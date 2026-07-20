@@ -224,3 +224,15 @@ async function runEventLoop(): Promise<void> {
     }
   }
 }
+
+/**
+ * TEST-ONLY: dispatch a synthetic opencode event to all registered runtime
+ * callbacks. Used by integration tests to inject deep-session events
+ * (task parts, permission.asked) through the real handleEvent pipeline
+ * without needing real multi-level task spawning.
+ */
+export function dispatchEventForTesting(event: OpenCodeEvent): void {
+  for (const callback of callbacks.values()) {
+    callback(event)
+  }
+}

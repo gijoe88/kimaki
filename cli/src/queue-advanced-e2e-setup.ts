@@ -775,6 +775,38 @@ export function createDeterministicMatchers(): DeterministicMatcher[] {
     },
   }
 
+  // Arbitrary-depth permission integration test setup: any short text reply
+  // is enough to establish the root session. The deep-session events (task
+  // edges + permission.asked) are injected synthetically through the real
+  // handleEvent pipeline via dispatchEventForTesting, so the deterministic
+  // provider only needs to produce an assistant response that creates the
+  // root session + finishes cleanly.
+  const nestedPermissionSetupMatcher: DeterministicMatcher = {
+    id: 'nested-permission-setup',
+    priority: 120,
+    when: {
+      lastMessageRole: 'user',
+      latestUserTextIncludes: 'NESTED_PERMISSION_SETUP_MARKER',
+    },
+    then: {
+      parts: [
+        { type: 'stream-start', warnings: [] },
+        { type: 'text-start', id: 'nested-perm-setup-text' },
+        {
+          type: 'text-delta',
+          id: 'nested-perm-setup-text',
+          delta: 'nested-permission-setup-ready',
+        },
+        { type: 'text-end', id: 'nested-perm-setup-text' },
+        {
+          type: 'finish',
+          finishReason: 'stop',
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        },
+      ],
+    },
+  }
+
   return [
     slowAbortMatcher,
     slowBusyMatcher,
@@ -787,6 +819,7 @@ export function createDeterministicMatchers(): DeterministicMatcher[] {
     permissionTypingFollowupMatcher,
     channelReferencePermissionMatcher,
     channelReferencePermissionFollowupMatcher,
+    nestedPermissionSetupMatcher,
 
     multiToolMatcher,
     multiToolFollowupMatcher,

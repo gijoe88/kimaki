@@ -57,13 +57,30 @@ function getTaskChildSessionId({
   return undefined
 }
 
+// Extracts a parent→child task edge from a single event.
+//
+// `parentSessionId` controls filtering:
+//   - When provided: only returns edges whose parent (part.sessionID) matches.
+//     Used by the depth-1 shortcuts (getDerivedSubtaskIndex / AgentType /
+//     SubagentSessions) which only look at direct children of mainSessionId.
+//   - When undefined: returns any task edge regardless of parent session.
+//     Used by the graph-aware chain walker (getDerivedSubtaskChain) which
+//     must see edges emitted by subagents at arbitrary depth.
+//
+// `parentSessionId` is also returned so callers can build the full graph
+// without re-reading the part.
 function getTaskCandidateFromEvent({
   event,
-  mainSessionId,
+  parentSessionId,
 }: {
   event: EventBufferEvent
-  mainSessionId: string
+  /**
+   * When provided, only return task edges whose parent (part.sessionID) matches.
+   * When undefined, return any task edge regardless of parent session.
+   */
+  parentSessionId?: string
 }): {
+  parentSessionId: string
   assistantMessageId: string
   childSessionId: string
   subagentType?: string
@@ -74,7 +91,7 @@ function getTaskCandidateFromEvent({
   }
 
   const part = event.properties.part
-  if (part.sessionID !== mainSessionId) {
+  if (parentSessionId !== undefined && part.sessionID !== parentSessionId) {
     return undefined
   }
   if (part.type !== 'tool' || part.tool !== 'task' || part.state.status === 'pending') {
@@ -89,6 +106,7 @@ function getTaskCandidateFromEvent({
   const subagentType = part.state.input?.subagent_type
   const description = part.state.input?.description
   return {
+    parentSessionId: part.sessionID,
     assistantMessageId: part.messageID,
     childSessionId,
     subagentType: typeof subagentType === 'string' ? subagentType : undefined,
@@ -620,6 +638,31 @@ export function getDerivedSubtaskIndex({
   candidateSessionId: string
   upToIndex?: number
 }): number | undefined {
+  return getDerivedSubtaskIndexForParent({
+    events,
+    parentSessionId: mainSessionId,
+    candidateSessionId,
+    upToIndex,
+  })
+}
+
+// Internal: same as getDerivedSubtaskIndex but parameterized by the parent
+// session ID instead of being hardcoded to mainSessionId. Used by the chain
+// label builder to compute per-hop indices within each parent's assistant
+// message. Indexing scope is the parent assistant message that spawned the
+// task tool calls (siblings under the same messageID), so numbering restarts
+// at 1 for each assistant message.
+function getDerivedSubtaskIndexForParent({
+  events,
+  parentSessionId,
+  candidateSessionId,
+  upToIndex,
+}: {
+  events: EventBufferEntry[]
+  parentSessionId: string
+  candidateSessionId: string
+  upToIndex?: number
+}): number | undefined {
   const end = upToIndex ?? events.length - 1
   let parentAssistantMessageId: string | undefined
 
@@ -630,7 +673,7 @@ export function getDerivedSubtaskIndex({
     }
     const candidate = getTaskCandidateFromEvent({
       event: entry.event,
-      mainSessionId,
+      parentSessionId,
     })
     if (!candidate) {
       continue
@@ -654,7 +697,7 @@ export function getDerivedSubtaskIndex({
     }
     const candidate = getTaskCandidateFromEvent({
       event: entry.event,
-      mainSessionId,
+      parentSessionId,
     })
     if (!candidate || candidate.assistantMessageId !== parentAssistantMessageId) {
       continue
@@ -688,7 +731,7 @@ export function getDerivedSubtaskAgentType({
     }
     const candidate = getTaskCandidateFromEvent({
       event: entry.event,
-      mainSessionId,
+      parentSessionId: mainSessionId,
     })
     if (!candidate || candidate.childSessionId !== candidateSessionId) {
       continue
@@ -718,7 +761,7 @@ export function getDerivedSubagentSessions({
     }
     const candidate = getTaskCandidateFromEvent({
       event: entry.event,
-      mainSessionId,
+      parentSessionId: mainSessionId,
     })
     if (!candidate || seenChildSessionIds.has(candidate.childSessionId)) {
       continue
@@ -734,4 +777,262 @@ export function getDerivedSubagentSessions({
   }
 
   return sessions
+}
+
+/**
+ * Returns the chain of session IDs from mainSessionId down to candidateSessionId
+ * (inclusive of both endpoints, ordered root → leaf), or undefined if
+ * candidateSessionId is not a descendant of mainSessionId in the task graph.
+ *
+ * The graph is reconstructed purely from `task` tool parts in the event stream:
+ * each part with `part.state.metadata.sessionId` (child) and `part.sessionID`
+ * (parent) defines a parent→child edge. There is no session.parentID field on
+ * session events, so the graph is derived solely from task tool parts.
+ *
+ * - If candidateSessionId === mainSessionId, returns [mainSessionId].
+ * - If candidateSessionId is not reachable from mainSessionId, returns undefined.
+ * - Cycle-safe via a visited set.
+ */
+export function getDerivedSubtaskChain({
+  events,
+  mainSessionId,
+  candidateSessionId,
+  upToIndex,
+}: {
+  events: EventBufferEntry[]
+  mainSessionId: string
+  candidateSessionId: string
+  upToIndex?: number
+}): string[] | undefined {
+  if (candidateSessionId === mainSessionId) {
+    return [mainSessionId]
+  }
+
+  const end = upToIndex ?? events.length - 1
+
+  // Build childSessionId → parentSessionId map from every task edge.
+  // Last-write-wins: a child session ID is unique per spawn, so in practice
+  // there is only one parent. If a duplicate appears (e.g., the same sessionId
+  // is reused across compaction boundaries), the latest edge wins.
+  const childToParent = new Map<string, string>()
+  for (let i = 0; i <= end; i++) {
+    const entry = events[i]
+    if (!entry) {
+      continue
+    }
+    const candidate = getTaskCandidateFromEvent({
+      event: entry.event,
+    })
+    if (!candidate) {
+      continue
+    }
+    childToParent.set(candidate.childSessionId, candidate.parentSessionId)
+  }
+
+  // Walk from candidate up to mainSessionId via parent links.
+  const chain: string[] = [candidateSessionId]
+  const visited = new Set<string>([candidateSessionId])
+  let current = candidateSessionId
+  while (true) {
+    if (current === mainSessionId) {
+      // chain is currently leaf → root; flip to root → leaf for the public
+      // contract. Array.prototype.reverse mutates in place.
+      chain.reverse()
+      return chain
+    }
+    const parent = childToParent.get(current)
+    if (!parent) {
+      return undefined
+    }
+    if (visited.has(parent)) {
+      // Defensive: cycle in the parent chain (shouldn't happen with unique
+      // session ids, but guard against malformed fixtures / reused ids).
+      return undefined
+    }
+    visited.add(parent)
+    chain.push(parent)
+    current = parent
+  }
+}
+
+/**
+ * Returns all descendant session IDs reachable from mainSessionId via task
+ * tool edges (any depth), NOT including mainSessionId itself. Uses the same
+ * parent→child graph as getDerivedSubtaskChain. Order is not guaranteed.
+ *
+ * Used by Layer 1 propagation (§5.6.2) to apply "Accept Always" rules to
+ * every currently-known descendant session. Cycle-safe via a visited set.
+ */
+export function getDerivedDescendantSessions({
+  events,
+  mainSessionId,
+  upToIndex,
+}: {
+  events: EventBufferEntry[]
+  mainSessionId: string
+  upToIndex?: number
+}): string[] {
+  const end = upToIndex ?? events.length - 1
+
+  // Build parent → children adjacency from every task edge.
+  const adjacency = new Map<string, Set<string>>()
+  for (let i = 0; i <= end; i++) {
+    const entry = events[i]
+    if (!entry) {
+      continue
+    }
+    const candidate = getTaskCandidateFromEvent({
+      event: entry.event,
+    })
+    if (!candidate) {
+      continue
+    }
+    let children = adjacency.get(candidate.parentSessionId)
+    if (!children) {
+      children = new Set<string>()
+      adjacency.set(candidate.parentSessionId, children)
+    }
+    children.add(candidate.childSessionId)
+  }
+
+  // BFS from mainSessionId, collecting every reachable child.
+  const visited = new Set<string>([mainSessionId])
+  const queue: string[] = [mainSessionId]
+  const descendants: string[] = []
+  while (queue.length > 0) {
+    const current = queue.shift()!
+    const children = adjacency.get(current)
+    if (!children) {
+      continue
+    }
+    for (const child of children) {
+      if (visited.has(child)) {
+        // Defensive: cycle in the graph (shouldn't happen with unique
+        // session ids, but guard against malformed fixtures / reused ids).
+        continue
+      }
+      visited.add(child)
+      descendants.push(child)
+      queue.push(child)
+    }
+  }
+  return descendants
+}
+
+export type DerivedSubtaskChainLabel = {
+  sessionId: string
+  /**
+   * Leaf-style label, e.g. "investigate-2" or "task-1". Always populated for
+   * hops after the root. Empty string for the root hop (mainSessionId).
+   */
+  label: string
+  subagentType?: string
+}
+
+/**
+ * Per-hop labels for the chain from mainSessionId to candidateSessionId.
+ *
+ * The returned array includes ALL hops root → leaf (so callers can index
+ * consistently):
+ *   - chain[0] === mainSessionId gets `{ label: '', subagentType: undefined }`
+ *     (root has no parent task, so no label). Callers that only need leaf
+ *     labels should skip the first entry.
+ *   - Each subsequent hop's label is `${agentType || 'task'}-${index}` where
+ *     index is the 1-based position of this child within the PARENT session's
+ *     assistant message that spawned it (scoped per parent assistant message,
+ *     exactly like getDerivedSubtaskIndex but parameterized by the hop's parent
+ *     session).
+ *
+ * Returns undefined when the chain itself is undefined (candidate not
+ * reachable from mainSessionId).
+ *
+ * Compaction note: the event buffer compaction preserves
+ * `state.input.subagent_type` for `task` tool parts (see
+ * thread-session-runtime.ts compactEventForEventBuffer), so labels survive
+ * compaction. If `subagent_type` is ever lost, the label degrades to
+ * `task-${index}` via the `agentType || 'task'` fallback.
+ */
+export function getDerivedSubtaskChainLabels({
+  events,
+  mainSessionId,
+  candidateSessionId,
+  upToIndex,
+}: {
+  events: EventBufferEntry[]
+  mainSessionId: string
+  candidateSessionId: string
+  upToIndex?: number
+}): DerivedSubtaskChainLabel[] | undefined {
+  const chain = getDerivedSubtaskChain({
+    events,
+    mainSessionId,
+    candidateSessionId,
+    upToIndex,
+  })
+  if (!chain) {
+    return undefined
+  }
+
+  const labels: DerivedSubtaskChainLabel[] = []
+  for (let i = 0; i < chain.length; i++) {
+    const sessionId = chain[i]!
+    if (i === 0) {
+      // Root hop: no parent task, so no label. Callers skip index 0 when
+      // they only need leaf-style labels.
+      labels.push({ sessionId, label: '' })
+      continue
+    }
+    const parentSessionId = chain[i - 1]!
+    const subagentType = getDerivedSubtaskAgentTypeForParent({
+      events,
+      parentSessionId,
+      candidateSessionId: sessionId,
+      upToIndex,
+    })
+    const index = getDerivedSubtaskIndexForParent({
+      events,
+      parentSessionId,
+      candidateSessionId: sessionId,
+      upToIndex,
+    })
+    // A reachable non-root hop always has a valid 1-based index. Fall back to
+    // 0 only if the chain walker returned a session we can't find an edge for
+    // (defensive — shouldn't happen for well-formed fixtures).
+    const safeIndex = index ?? 0
+    const label = `${subagentType || 'task'}-${safeIndex}`
+    labels.push({ sessionId, label, subagentType })
+  }
+  return labels
+}
+
+// Internal: same as getDerivedSubtaskAgentType but parameterized by parent.
+// Used by getDerivedSubtaskChainLabels to look up the subagent_type for any
+// hop in the chain, not just depth-1 children of mainSessionId.
+function getDerivedSubtaskAgentTypeForParent({
+  events,
+  parentSessionId,
+  candidateSessionId,
+  upToIndex,
+}: {
+  events: EventBufferEntry[]
+  parentSessionId: string
+  candidateSessionId: string
+  upToIndex?: number
+}): string | undefined {
+  const end = upToIndex ?? events.length - 1
+  for (let i = end; i >= 0; i--) {
+    const entry = events[i]
+    if (!entry) {
+      continue
+    }
+    const candidate = getTaskCandidateFromEvent({
+      event: entry.event,
+      parentSessionId,
+    })
+    if (!candidate || candidate.childSessionId !== candidateSessionId) {
+      continue
+    }
+    return candidate.subagentType
+  }
+  return undefined
 }

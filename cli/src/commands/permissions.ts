@@ -16,7 +16,12 @@ import {
   MessageFlags,
 } from 'discord.js'
 import crypto from 'node:crypto'
-import type { OpencodeClient, PermissionRequest } from '@opencode-ai/sdk/v2'
+import type {
+  OpencodeClient,
+  PermissionRequest,
+  PermissionRule,
+  PermissionRuleset,
+} from '@opencode-ai/sdk/v2'
 import { getOpencodeClient } from '../opencode.js'
 import { getPermissionTimeoutMs } from '../config.js'
 import { NOTIFY_MESSAGE_FLAGS } from '../discord-utils.js'
@@ -92,6 +97,78 @@ export function arePatternsCoveredBy({
   })
 }
 
+/**
+ * Whether a permission request is covered by a set of allow rules.
+ * Critical §11 invariant: a rule only covers a request when ALL of:
+ *   - same permission type (rule.permission === permission.permission)
+ *   - action is 'allow' (deny/ask never propagate)
+ *   - every request pattern is covered by some matching rule's pattern
+ * Never auto-accepts a broader permission type than what was approved
+ * (e.g. an `edit` rule will never cover a `bash` prompt even if patterns
+ * overlap). Used by Layer 2 (ThreadSessionRuntime) to gate auto-accept
+ * of prompts that match previously-"Accept Always"-ed rules.
+ */
+export function isPermissionCoveredByRules({
+  rules,
+  permission,
+}: {
+  rules: PermissionRuleset
+  permission: Pick<PermissionRequest, 'permission' | 'patterns'>
+}): boolean {
+  const coveringPatterns = rules
+    .filter(
+      (rule) =>
+        rule.permission === permission.permission && rule.action === 'allow',
+    )
+    .map((rule) => rule.pattern)
+  if (coveringPatterns.length === 0) {
+    return false
+  }
+  return arePatternsCoveredBy({
+    patterns: permission.patterns,
+    coveringPatterns,
+  })
+}
+
+/**
+ * Deduplication key for a single permission rule. Two rules with the same key
+ * are semantically identical (same permission type, pattern, and action), so
+ * only one needs to be persisted. Used by Layer 1 (propagation via
+ * session.update) and Layer 2 (in-memory alwaysAcceptedRules) to keep the
+ * ruleset clean across repeated "Accept Always" clicks — the opencode server's
+ * `Permission.merge` is `rulesets.flat()` (no dedupe), so the client must
+ * dedupe itself to avoid unbounded bloat.
+ */
+export function permissionRuleKey(rule: PermissionRule): string {
+  return `${rule.permission}::${rule.pattern}::${rule.action}`
+}
+
+/**
+ * Returns the deduplicated union of two permission rulesets, preserving
+ * first-occurrence order (all of `existing` first, then any `added` rules
+ * whose key is not already in `existing`). Pure / side-effect free.
+ *
+ * Caller invariant: `existing` is itself deduped (maintained by always
+ * routing mutations through this helper). If `existing` happens to contain
+ * internal dupes, the result is still correct (no duplicate keys), only the
+ * "delta" computation in callers may need to compare against the deduped
+ * length rather than `existing.length`.
+ */
+export function dedupePermissionRuleset(
+  existing: PermissionRuleset,
+  added: PermissionRuleset,
+): PermissionRuleset {
+  const seen = new Set(existing.map(permissionRuleKey))
+  const result: PermissionRuleset = [...existing]
+  for (const rule of added) {
+    const key = permissionRuleKey(rule)
+    if (seen.has(key)) continue
+    seen.add(key)
+    result.push(rule)
+  }
+  return result
+}
+
 export function compactPermissionPatterns(patterns: string[]): string[] {
   const uniquePatterns = Array.from(new Set(patterns))
   return uniquePatterns.filter((pattern, index) => {
@@ -110,6 +187,18 @@ type PendingPermissionContext = {
   directory: string
   thread: ThreadChannel
   contextHash: string
+  // Persisted so updatePermissionMessage can keep rendering the
+  // **From:** line (with depth suffix) after a button is clicked or the
+  // TTL expires. Without this the label would disappear on update.
+  subtaskLabel?: string
+  depth?: number
+  /**
+   * Invoked when the user clicks "Accept Always". Receives the parsed
+   * PermissionRuleset entries to propagate. The runtime supplies this; it
+   * appends to alwaysAcceptedRules (Layer 2) and will later also call
+   * session.update (Layer 1, Phase C2).
+   */
+  onAcceptAlways?: (addedRules: PermissionRuleset) => Promise<void>
   messageId?: string
 }
 
@@ -142,11 +231,15 @@ export async function showPermissionButtons({
   permission,
   directory,
   subtaskLabel,
+  depth,
+  onAcceptAlways,
 }: {
   thread: ThreadChannel
   permission: PermissionRequest
   directory: string
   subtaskLabel?: string
+  depth?: number
+  onAcceptAlways?: (addedRules: PermissionRuleset) => Promise<void>
 }): Promise<{ messageId: string; contextHash: string }> {
   const contextHash = crypto.randomBytes(8).toString('hex')
 
@@ -156,6 +249,9 @@ export async function showPermissionButtons({
     directory,
     thread,
     contextHash,
+    subtaskLabel,
+    depth,
+    onAcceptAlways,
   }
 
   pendingPermissionContexts.set(contextHash, context)
@@ -224,7 +320,8 @@ export async function showPermissionButtons({
     denyButton,
   )
 
-  const subtaskLine = subtaskLabel ? `**From:** \`${subtaskLabel}\`\n` : ''
+  const depthSuffix = depth && depth >= 2 ? `   (depth ${depth})` : ''
+  const subtaskLine = subtaskLabel ? `**From:** \`${subtaskLabel}\`${depthSuffix}\n` : ''
   const externalDirLine =
     permission.permission === 'external_directory'
       ? `Agent is accessing files outside the project. [Learn more](https://opencode.ai/docs/permissions/#external-directories)\n`
@@ -248,7 +345,7 @@ export async function showPermissionButtons({
   return { messageId: permissionMessage.id, contextHash }
 }
 
-function updatePermissionMessage({
+export function updatePermissionMessage({
   context,
   status,
 }: {
@@ -262,6 +359,10 @@ function updatePermissionMessage({
     .fetch(context.messageId)
     .then((message) => {
       const patternStr = compactPermissionPatterns(context.permission.patterns).join(', ')
+      const depthSuffix = context.depth && context.depth >= 2 ? `   (depth ${context.depth})` : ''
+      const subtaskLine = context.subtaskLabel
+        ? `**From:** \`${context.subtaskLabel}\`${depthSuffix}\n`
+        : ''
       const externalDirLine =
         context.permission.permission === 'external_directory'
           ? 'Agent is accessing files outside the project. [Learn more](https://opencode.ai/docs/permissions/#external-directories)\n'
@@ -269,6 +370,7 @@ function updatePermissionMessage({
       return message.edit({
         content:
           `⚠️ **Permission Required**\n` +
+          subtaskLine +
           `**Type:** \`${context.permission.permission}\`\n` +
           externalDirLine +
           (patternStr ? `**Pattern:** \`${patternStr}\`\n` : '') +
@@ -429,6 +531,32 @@ export async function handlePermissionButton(
     logger.log(
       `Permission ${context.permission.id} ${response} (${requestIds.length} request(s))`,
     )
+
+    // §5.6.2 / §5.6.4: propagate "Accept Always" rules to the runtime so
+    // future prompts for the same permission type + covered patterns from
+    // any reachable session (root + descendants) are auto-accepted without
+    // re-showing buttons. Runs AFTER updatePermissionMessage so the user
+    // sees fast feedback first. Best-effort: failure here doesn't roll back
+    // the already-succeeded permission.reply, it just means future prompts
+    // may re-show buttons.
+    if (response === 'always' && context.onAcceptAlways) {
+      const patternsToAdd =
+        context.permission.always && context.permission.always.length > 0
+          ? context.permission.always
+          : context.permission.patterns
+      const addedRules: PermissionRuleset = patternsToAdd.map((pattern) => ({
+        permission: context.permission.permission,
+        pattern,
+        action: 'allow' as const,
+      }))
+      if (addedRules.length > 0) {
+        try {
+          await context.onAcceptAlways(addedRules)
+        } catch (error) {
+          logger.error('Failed to propagate Accept Always rules:', error)
+        }
+      }
+    }
   } catch (error) {
     logger.error('Error handling permission:', error)
     await interaction.editReply({

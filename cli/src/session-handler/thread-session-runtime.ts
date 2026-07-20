@@ -66,7 +66,10 @@ import {
   showPermissionButtons,
   addPermissionRequestToContext,
   arePatternsCoveredBy,
+  dedupePermissionRuleset,
+  isPermissionCoveredByRules,
   pendingPermissionContexts,
+  updatePermissionMessage,
 } from '../commands/permissions.js'
 import {
   showAskUserQuestionDropdowns,
@@ -107,8 +110,11 @@ import {
   getCurrentTurnStartTime,
   isSessionBusy,
   getLatestRunInfo,
+  getDerivedDescendantSessions,
   getDerivedSubtaskIndex,
   getDerivedSubtaskAgentType,
+  getDerivedSubtaskChain,
+  getDerivedSubtaskChainLabels,
   getLatestAssistantMessageIdForLatestUserTurn,
   hasAssistantMessageCompletedBefore,
   isAssistantMessageInLatestUserTurn,
@@ -700,6 +706,15 @@ export class ThreadSessionRuntime {
   // use dispatchAction internally.
   private preprocessChain: Promise<void> = Promise.resolve()
 
+  /**
+   * Permission rules accepted via "Accept Always" within this root session's
+   * scope (§5.6.2 Layer 2 of the arbitrary-depth permissions design).
+   * Auto-accepts covered prompts from the root session and ANY descendant
+   * without re-showing buttons. In-memory only; cleared on dispose. Layer 1
+   * (Phase C2) will additionally persist these to opencode via session.update.
+   */
+  private alwaysAcceptedRules: PermissionRuleset = []
+
   constructor(opts: RuntimeOptions) {
     this.threadId = opts.threadId
     this.projectDirectory = opts.projectDirectory
@@ -998,6 +1013,184 @@ export class ThreadSessionRuntime {
     return { label, assistantMessageId }
   }
 
+  // Reachability check for the per-runtime event filter (§5.2 of the
+  // arbitrary-depth permissions design). A session is reachable when it is
+  // either the main session itself OR a descendant at any depth in the task
+  // graph derived from the live event buffer. Depth-1 children are reachable
+  // because getDerivedSubtaskChain walks parent→child edges through arbitrary
+  // depth. Returns false for stale events from previous sessions.
+  private isSessionReachable(candidateSessionId: string): boolean {
+    const sessionId = this.state?.sessionId
+    if (!sessionId) return false
+    if (candidateSessionId === sessionId) return true
+    return (
+      getDerivedSubtaskChain({
+        events: this.eventBuffer,
+        mainSessionId: sessionId,
+        candidateSessionId,
+      }) !== undefined
+    )
+  }
+
+  // §5.6.2 Layer 2: does an "Accept Always" rule from this root session's
+  // scope cover the incoming permission prompt? Critical (§11 threat model):
+  // only matches rules with the SAME permission type + action 'allow' whose
+  // patterns genuinely cover the prompt's patterns. Never auto-accepts a
+  // broader permission type than what was approved (e.g. an `edit` rule must
+  // not auto-accept a `bash` prompt even if patterns overlap).
+  private isPermissionCoveredByAlwaysAccepted(
+    permission: PermissionRequest,
+  ): boolean {
+    return isPermissionCoveredByRules({
+      rules: this.alwaysAcceptedRules,
+      permission,
+    })
+  }
+
+  // §5.6.2 Layer 1: persist "Accept Always" rules to opencode via
+  // session.update so they survive this runtime's lifetime and apply to
+  // future task-spawned children (if opencode cascades). Targets the root
+  // session plus every currently-known descendant discovered via the task
+  // graph (any depth) — this catches descendants that are already running
+  // mid-chain before the rule was added.
+  //
+  // Strategy: fetch+union+update. The opencode HTTP API merges the incoming
+  // ruleset with the existing one (`Permission.merge(existing, payload)`),
+  // but `Permission.merge` is `rulesets.flat()` — it does NOT dedupe. To
+  // keep the persisted ruleset clean across repeated "Accept Always" clicks
+  // we fetch the current rules, dedupe against the added ones, and write the
+  // union. This is also robust to a future server change that switches to
+  // replace semantics (the union would still be correct).
+  //
+  // Best-effort: every call is wrapped so one failure (e.g. a descendant
+  // that already exited and 404s) doesn't abort the rest. The root session
+  // update is the most important; its failure is logged at error level.
+  // Per-session updates run sequentially to avoid overwhelming the opencode
+  // server; descendant counts are small (typically 0-3) so the latency is
+  // acceptable. Caller (onAcceptAlways) wraps this whole method in .catch
+  // so any unexpected throw never blocks the Layer 2 append or the
+  // already-succeeded permission.reply.
+  private async propagateAlwaysRulesToSessions(
+    addedRules: PermissionRuleset,
+  ): Promise<void> {
+    const sessionId = this.state?.sessionId
+    if (!sessionId || addedRules.length === 0) {
+      return
+    }
+    const client = getOpencodeClient(this.sdkDirectory)
+    if (!client) {
+      logger.warn(
+        '[PERMISSION ALWAYS] No opencode client; skipping Layer 1 propagation',
+      )
+      return
+    }
+
+    // Root + all currently-known descendants (any depth). Every session in
+    // the chain shares the runtime's sdkDirectory (§8.8) so the directory
+    // param is the same for every get/update call.
+    const descendantIds = getDerivedDescendantSessions({
+      events: this.eventBuffer,
+      mainSessionId: sessionId,
+    })
+    const targetSessionIds = [sessionId, ...descendantIds]
+
+    let successCount = 0
+    for (const targetSessionId of targetSessionIds) {
+      const isRoot = targetSessionId === sessionId
+      try {
+        // Fetch current rules so we can dedupe before writing. session.get
+        // exposes `permission?: PermissionRuleset` (v2 SDK), and session.update
+        // accepts the same field. If get fails (e.g. transient network error)
+        // we still attempt the update with just the added rules — the server's
+        // own merge semantics will combine them with whatever it has.
+        const getResponse = await client.session
+          .get({
+            sessionID: targetSessionId,
+            directory: this.sdkDirectory,
+          })
+          .catch(
+            (e) => new OpenCodeSdkError({ operation: 'session.get', cause: e }),
+          )
+        const existingRules: PermissionRuleset =
+          getResponse instanceof Error || getResponse.error || !getResponse.data
+            ? []
+            : (getResponse.data.permission ?? [])
+
+        // Dedupe by `permission::pattern::action` so repeat clicks
+        // don't bloat the persisted ruleset. The opencode server's
+        // `Permission.merge` is `rulesets.flat()` (no dedupe), so we
+        // must dedupe client-side to avoid unbounded growth across
+        // repeated "Accept Always" clicks.
+        const union: PermissionRuleset = dedupePermissionRuleset(
+          existingRules,
+          addedRules,
+        )
+        if (union.length === existingRules.length) {
+          // Nothing new to persist for this session; skip the write.
+          successCount++
+          continue
+        }
+
+        const updateResponse = await client.session
+          .update({
+            sessionID: targetSessionId,
+            directory: this.sdkDirectory,
+            permission: union,
+          })
+          .catch(
+            (e) =>
+              new OpenCodeSdkError({ operation: 'session.update', cause: e }),
+          )
+        if (updateResponse instanceof Error) {
+          // Descendant sessions may have already exited (404). Log root
+          // failures at error level so they're visible; descendants at warn.
+          if (isRoot) {
+            logger.error(
+              `[PERMISSION ALWAYS] Layer 1 update failed for root session ${targetSessionId}: ${updateResponse.message}`,
+            )
+          } else {
+            logger.warn(
+              `[PERMISSION ALWAYS] Layer 1 update failed for descendant session ${targetSessionId}: ${updateResponse.message}`,
+            )
+          }
+          continue
+        }
+        if (updateResponse.error) {
+          if (isRoot) {
+            logger.error(
+              `[PERMISSION ALWAYS] Layer 1 update rejected for root session ${targetSessionId}: ${JSON.stringify(updateResponse.error)}`,
+            )
+          } else {
+            logger.warn(
+              `[PERMISSION ALWAYS] Layer 1 update rejected for descendant session ${targetSessionId}: ${JSON.stringify(updateResponse.error)}`,
+            )
+          }
+          continue
+        }
+        successCount++
+      } catch (e) {
+        // Defensive: any unexpected throw on a single session is logged but
+        // does not abort the loop. The caller's outer .catch will also catch
+        // anything that escapes here.
+        if (isRoot) {
+          logger.error(
+            `[PERMISSION ALWAYS] Layer 1 propagation threw for root session ${targetSessionId}:`,
+            e,
+          )
+        } else {
+          logger.warn(
+            `[PERMISSION ALWAYS] Layer 1 propagation threw for descendant session ${targetSessionId}:`,
+            e,
+          )
+        }
+      }
+    }
+
+    logger.log(
+      `[PERMISSION ALWAYS] Layer 1 propagated ${addedRules.length} rule(s) to ${successCount}/${targetSessionIds.length} session(s)`,
+    )
+  }
+
   // ── Lifecycle ────────────────────────────────────────────────
 
   dispose(): void {
@@ -1012,6 +1205,7 @@ export class ThreadSessionRuntime {
     this.nextEventIndex = 0
     this.partBuffer.clear()
     this.preprocessChain = Promise.resolve()
+    this.alwaysAcceptedRules = []
 
     // Don't clear actionQueue here — queued closures own resolve/reject for
     // dispatchAction() promises. Dropping them would leave awaiting callers
@@ -1362,14 +1556,15 @@ export class ThreadSessionRuntime {
     const isScopedToastEvent = Boolean(toastSessionId)
 
     // Drop events that don't match current session (stale events from
-    // previous sessions), unless it's a global event or a subtask session.
+    // previous sessions), unless it's a global event or a reachable subagent
+    // session (depth-1 child OR deeper descendant in the task graph).
     if (!isGlobalEvent && eventSessionId && eventSessionId !== sessionId) {
-      if (!this.getSubtaskInfoForSession(eventSessionId)) {
+      if (!this.isSessionReachable(eventSessionId)) {
         return // stale event from previous session
       }
     }
     if (isScopedToastEvent && toastSessionId !== sessionId) {
-      if (!this.getSubtaskInfoForSession(toastSessionId!)) {
+      if (!this.isSessionReachable(toastSessionId!)) {
         return
       }
     }
@@ -1400,6 +1595,9 @@ export class ThreadSessionRuntime {
         break
       case 'session.error':
         await this.handleSessionError(event.properties)
+        break
+      case 'session.deleted':
+        await this.handleSessionDeleted(event.properties)
         break
       case 'permission.asked':
         await this.handlePermissionAsked(event.properties)
@@ -1982,20 +2180,22 @@ export class ThreadSessionRuntime {
   private async handlePartUpdated(part: Part): Promise<void> {
     this.storePart(part)
     const sessionId = this.state?.sessionId
-
+    const isMain = part.sessionID === sessionId
+    if (!isMain && !this.isSessionReachable(part.sessionID)) {
+      return // stale event from previous session
+    }
+    if (isMain) {
+      await this.handleMainPart(part)
+      return
+    }
+    // Reachable subagent part. Only DISPLAY depth-1 children (§5.5 —
+    // subagent text/tool display stays depth-1 in v1; only interactive UI
+    // like permissions crosses depth). Deeper descendants are buffered
+    // (for chain derivation) but not rendered.
     const subtaskInfo = this.getSubtaskInfoForSession(part.sessionID)
-    const isSubtaskEvent = Boolean(subtaskInfo)
-
-    if (part.sessionID !== sessionId && !isSubtaskEvent) {
-      return
-    }
-
-    if (isSubtaskEvent && subtaskInfo) {
+    if (subtaskInfo) {
       await this.handleSubtaskPart(part, subtaskInfo)
-      return
     }
-
-    await this.handleMainPart(part)
   }
 
   private async handleMainPart(part: Part): Promise<void> {
@@ -2250,38 +2450,42 @@ export class ThreadSessionRuntime {
   private async handleSessionIdle(idleSessionId: string): Promise<void> {
     const sessionId = this.state?.sessionId
 
-    // ── Subtask idle ──────────────────────────────────────────
-    const subtask = this.getSubtaskInfoForSession(idleSessionId)
-    if (subtask) {
-      logger.log(
-        `[SUBTASK IDLE] Subtask "${subtask?.label}" completed`,
-      )
+    // ── Non-main session idle ─────────────────────────────────
+    // Includes depth-1 subtasks AND deeper descendants. For depth ≥ 2 this
+    // previously fell through silently; we now at least dismiss any stale
+    // permission prompts from the exiting subtree (§8.1, §8.4 of the
+    // arbitrary-depth permissions design).
+    if (idleSessionId !== sessionId) {
+      if (this.isSessionReachable(idleSessionId)) {
+        const subtask = this.getSubtaskInfoForSession(idleSessionId)
+        logger.log(
+          `[SUBTASK IDLE] ${subtask ? `Subtask "${subtask.label}"` : `Session ${idleSessionId}`} went idle`,
+        )
+        await this.dismissPendingPermissionsForExitedSession(idleSessionId)
+      }
       return
     }
 
     // ── Main session idle ─────────────────────────────────────
     // The event is also pushed into the event buffer by handleEvent(),
     // so waitForEvent() consumers (abort settlement) will see it too.
-    if (idleSessionId === sessionId) {
-      const shouldDrainQueuedMessages = doesLatestUserTurnHaveNaturalCompletion({
-        events: this.eventBuffer,
-        sessionId: idleSessionId,
-      })
+    const shouldDrainQueuedMessages = doesLatestUserTurnHaveNaturalCompletion({
+      events: this.eventBuffer,
+      sessionId: idleSessionId,
+    })
 
-      logger.log(
-        `[SESSION IDLE] session became idle sessionId=${sessionId} drainQueue=${shouldDrainQueuedMessages} ${this.formatRunStateForLog()}`,
-      )
-      await this.persistEventBufferDebounced.flush()
+    logger.log(
+      `[SESSION IDLE] session became idle sessionId=${sessionId} drainQueue=${shouldDrainQueuedMessages} ${this.formatRunStateForLog()}`,
+    )
+    await this.persistEventBufferDebounced.flush()
 
-      if (!shouldDrainQueuedMessages) {
-        return
-      }
-      // Drain any local-queue items that arrived while the session was busy
-      // (e.g. slow voice transcription with queueMessage=true completing
-      // during or just before idle). Same pattern as handleSessionError.
-      await this.tryDrainQueue({ showIndicator: true })
+    if (!shouldDrainQueuedMessages) {
       return
     }
+    // Drain any local-queue items that arrived while the session was busy
+    // (e.g. slow voice transcription with queueMessage=true completing
+    // during or just before idle). Same pattern as handleSessionError.
+    await this.tryDrainQueue({ showIndicator: true })
   }
 
   private async handleNaturalAssistantCompletion({
@@ -2343,13 +2547,28 @@ export class ThreadSessionRuntime {
     }
   }): Promise<void> {
     const sessionId = this.state?.sessionId
-    if (!properties.sessionID || properties.sessionID !== sessionId) {
-      logger.log(
-        `Ignoring error for different session (expected: ${sessionId}, got: ${properties.sessionID})`,
-      )
+    if (!properties.sessionID) {
       return
     }
 
+    const isMain = properties.sessionID === sessionId
+
+    // ── Non-main session error ────────────────────────────────
+    // Don't display deep errors in the root thread (§5.5 — subagent
+    // text/tool display stays depth-1 in v1; we don't want to spam the
+    // root thread with deep error text). But proactively dismiss any
+    // stale permission prompts from the dying subtree (§8.1, §8.4).
+    if (!isMain) {
+      if (this.isSessionReachable(properties.sessionID)) {
+        logger.log(
+          `[SUBTASK ERROR] Session ${properties.sessionID} errored`,
+        )
+        await this.dismissPendingPermissionsForExitedSession(properties.sessionID)
+      }
+      return
+    }
+
+    // ── Main session error ────────────────────────────────────
     // Skip abort errors — they are expected when operations are cancelled
     if (properties.error?.name === 'MessageAbortedError') {
       logger.log(
@@ -2378,22 +2597,192 @@ export class ThreadSessionRuntime {
     await this.tryDrainQueue({ showIndicator: true })
   }
 
+  private async handleSessionDeleted(properties: {
+    sessionID: string
+  }): Promise<void> {
+    const sessionId = this.state?.sessionId
+    const deletedSessionId = properties.sessionID
+    // Main session deletion is handled by dispose() → cleanupPendingUiForThread.
+    if (!deletedSessionId || deletedSessionId === sessionId) {
+      return
+    }
+    if (!this.isSessionReachable(deletedSessionId)) {
+      return
+    }
+    logger.log(`[SUBTASK DELETED] Session ${deletedSessionId} deleted`)
+    await this.dismissPendingPermissionsForExitedSession(deletedSessionId)
+  }
+
+  /**
+   * Proactively dismiss pending permission prompts when a subagent session
+   * exits (idle/error/deleted) before the user answers (§8.1, §8.4 of the
+   * arbitrary-depth permissions design). Without this, stale prompts sit
+   * until the 10-minute TTL. Finds prompts whose session is the exited
+   * session OR any of its descendants (the whole subtree is dead) and
+   * rejects them with a clear status message.
+   *
+   * Atomicity: claims each context via get+delete BEFORE awaiting any reply,
+   * so the TTL timer / button click (which also take the context) cannot
+   * double-reply. Mirrors the dispose-time pattern in cleanupPendingUiForThread.
+   *
+   * Dedupe edge case (§8.5): a deduped context aggregates requestIDs from
+   * multiple sessions. If only one of those sessions exits, we still reject
+   * the whole context (and every aggregated requestId, including ones from
+   * alive sessions). Alive sessions see a tool error and work around it via
+   * continue_loop_on_deny. This is acceptable per §8.4 — proactive dismissal
+   * is a strict improvement, and the alternative (splitting the context) is
+   * far more complex for negligible benefit.
+   */
+  private async dismissPendingPermissionsForExitedSession(
+    exitedSessionId: string,
+  ): Promise<void> {
+    const threadPermissions = pendingPermissions.get(this.thread.id)
+    if (!threadPermissions || threadPermissions.size === 0) {
+      return
+    }
+
+    // The exited session's whole subtree is dead — find prompts from the
+    // exited session itself or any of its descendants.
+    const descendantIds = new Set(
+      getDerivedDescendantSessions({
+        events: this.eventBuffer,
+        mainSessionId: exitedSessionId,
+      }),
+    )
+
+    const toDismiss: string[] = [] // permission IDs
+    for (const [permissionId, entry] of threadPermissions) {
+      if (
+        entry.permission.sessionID === exitedSessionId ||
+        descendantIds.has(entry.permission.sessionID)
+      ) {
+        toDismiss.push(permissionId)
+      }
+    }
+
+    if (toDismiss.length === 0) {
+      return
+    }
+
+    const client = getOpencodeClient(this.sdkDirectory)
+    let dismissedCount = 0
+    for (const permissionId of toDismiss) {
+      const entry = threadPermissions.get(permissionId)
+      if (!entry) {
+        continue
+      }
+
+      // Atomic claim: delete BEFORE any await so the TTL timer / button click
+      // cannot win the same context and double-reply.
+      const ctx = pendingPermissionContexts.get(entry.contextHash)
+      if (ctx) {
+        pendingPermissionContexts.delete(entry.contextHash)
+        if (client) {
+          const requestIds: string[] =
+            ctx.requestIds.length > 0 ? ctx.requestIds : [ctx.permission.id]
+          await Promise.all(
+            requestIds.map((requestId) =>
+              client.permission
+                .reply({
+                  requestID: requestId,
+                  directory: ctx.directory,
+                  reply: 'reject',
+                })
+                .catch((e) => {
+                  logger.error('Failed to reject stale permission:', e)
+                }),
+            ),
+          )
+        }
+        updatePermissionMessage({
+          context: ctx,
+          status: '_Subagent exited before answer._',
+        })
+      }
+      // If ctx was already taken (by TTL or click), just clean up our local
+      // tracking — no duplicate reply is sent.
+      threadPermissions.delete(permissionId)
+      dismissedCount++
+    }
+
+    if (threadPermissions.size === 0) {
+      pendingPermissions.delete(this.thread.id)
+    }
+    this.onInteractiveUiStateChanged()
+    logger.log(
+      `[PERMISSION DISMISSED] ${dismissedCount} stale prompt(s) for exited session ${exitedSessionId}`,
+    )
+  }
+
   private async handlePermissionAsked(
     permission: PermissionRequest,
   ): Promise<void> {
     const sessionId = this.state?.sessionId
-    const subtaskInfo = this.getSubtaskInfoForSession(permission.sessionID)
     const isMainSession = permission.sessionID === sessionId
-    const isSubtaskSession = Boolean(subtaskInfo)
 
-    if (!isMainSession && !isSubtaskSession) {
-      logger.log(
-        `[PERMISSION IGNORED] Permission for unknown session (expected: ${sessionId} or subtask, got: ${permission.sessionID})`,
-      )
-      return
+    // Accept permission prompts from ANY reachable session (root +
+    // descendants at any depth). For non-main sessions we walk the live
+    // task graph (§5.3 of the arbitrary-depth permissions design) so that
+    // depth ≥ 2 prompts are no longer silently dropped.
+    let chain: string[] | undefined
+    if (!isMainSession) {
+      if (!sessionId) {
+        return
+      }
+      chain = getDerivedSubtaskChain({
+        events: this.eventBuffer,
+        mainSessionId: sessionId,
+        candidateSessionId: permission.sessionID,
+      })
+      if (!chain) {
+        logger.log(
+          `[PERMISSION IGNORED] Permission for unknown session (expected: ${sessionId} or descendant, got: ${permission.sessionID})`,
+        )
+        return
+      }
     }
 
-    const subtaskLabel = subtaskInfo?.label
+    // §5.6.2 Layer 2: auto-accept if covered by an "Accept Always" rule from
+    // this root session's scope. Prevents re-prompting for the same pattern
+    // across the whole root session tree (ancestors, siblings, descendants).
+    // Critical (§11): only matches same permission type + genuinely-covered
+    // patterns — never auto-accepts a broader permission type than approved.
+    if (this.isPermissionCoveredByAlwaysAccepted(permission)) {
+      logger.log(
+        `[PERMISSION AUTO-ACCEPTED] ${permission.permission} ${permission.patterns.join(',')} covered by root-session always-rule (session=${permission.sessionID})`,
+      )
+      const client = getOpencodeClient(this.sdkDirectory)
+      if (client) {
+        await client.permission
+          .reply({
+            requestID: permission.id,
+            directory: this.sdkDirectory,
+            reply: 'once',
+          })
+          .catch((e) => {
+            logger.error('Failed to auto-accept permission:', e)
+          })
+      }
+      return // do NOT show buttons
+    }
+
+    // Build leaf-only label + depth per §6.2 (label = leaf subagent, depth
+    // suffix only when >= 2 so depth-1 prompts stay visually identical).
+    let subtaskLabel: string | undefined
+    let depth: number | undefined
+    if (chain && chain.length > 1) {
+      const labels = getDerivedSubtaskChainLabels({
+        events: this.eventBuffer,
+        mainSessionId: sessionId!,
+        candidateSessionId: permission.sessionID,
+      })
+      const leaf = labels?.[labels.length - 1]
+      // labels[0] is the root hop (label ''); the last is the leaf.
+      if (leaf && leaf.label) {
+        subtaskLabel = leaf.label
+        depth = chain.length - 1
+      }
+    }
 
     const dedupeKey = buildPermissionDedupeKey({
       permission,
@@ -2446,7 +2835,7 @@ export class ThreadSessionRuntime {
     }
 
     logger.log(
-      `Permission requested: permission=${permission.permission}, patterns=${permission.patterns.join(', ')}${subtaskLabel ? `, subtask=${subtaskLabel}` : ''}`,
+      `Permission requested: permission=${permission.permission}, patterns=${permission.patterns.join(', ')}${subtaskLabel ? `, subtask=${subtaskLabel}` : ''}${depth ? `, depth=${depth}` : ''}`,
     )
 
     this.stopTyping()
@@ -2456,6 +2845,40 @@ export class ThreadSessionRuntime {
       permission,
       directory: this.sdkDirectory,
       subtaskLabel,
+      depth,
+      onAcceptAlways: async (addedRules) => {
+        if (this.disposed) return
+
+        // ── Layer 2 (§5.6.2): in-memory safety net. Synchronous so it takes
+        // effect immediately for any concurrent or future permission.asked.
+        // This is the deterministic enforcement that catches future prompts
+        // from any reachable session (root + all descendants), even before
+        // opencode's session.update propagates and even if the descendant
+        // graph changes mid-run.
+        const union: PermissionRuleset = dedupePermissionRuleset(
+          this.alwaysAcceptedRules,
+          addedRules,
+        )
+        const addedCount = union.length - this.alwaysAcceptedRules.length
+        if (addedCount > 0) {
+          this.alwaysAcceptedRules = union
+          logger.log(
+            `[PERMISSION ALWAYS] Added ${addedCount} always-rule(s) to root-session scope: ${addedRules
+              .map((r) => `${r.permission}:${r.pattern}`)
+              .join(', ')}`,
+          )
+        }
+
+        // ── Layer 1 (§5.6.2): persist to opencode so the rules survive this
+        // runtime's lifetime and (if opencode cascades) apply to future
+        // task-spawned children. Best-effort: failures are logged, never
+        // block the already-succeeded permission.reply. Runs AFTER the
+        // Layer 2 append so the in-memory safety net is consistent even if
+        // this throws.
+        await this.propagateAlwaysRulesToSessions(addedRules).catch((e) => {
+          logger.error('[PERMISSION ALWAYS] Layer 1 propagation failed:', e)
+        })
+      },
     })
 
     if (!pendingPermissions.has(this.thread.id)) {
@@ -2476,11 +2899,10 @@ export class ThreadSessionRuntime {
     sessionID: string
   }): void {
     const sessionId = this.state?.sessionId
-    const subtaskInfo = this.getSubtaskInfoForSession(properties.sessionID)
     const isMainSession = properties.sessionID === sessionId
-    const isSubtaskSession = Boolean(subtaskInfo)
+    const isReachable = isMainSession || this.isSessionReachable(properties.sessionID)
 
-    if (!isMainSession && !isSubtaskSession) {
+    if (!isReachable) {
       return
     }
 
