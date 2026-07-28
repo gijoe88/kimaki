@@ -20,22 +20,24 @@ import { execAsync } from '../src/exec-async.js'
 // ─── Config ──────────────────────────────────────────────────────────────────
 // Each entry is a GitHub URL. Subpath after /tree/branch/ narrows the search.
 const SKILL_SOURCES: string[] = [
-  'https://github.com/remorses/playwriter',
-  'https://github.com/remorses/tuistory',
-  'https://github.com/remorses/zele',
-  'https://github.com/remorses/critique',
-  'https://github.com/remorses/errore',
-  'https://github.com/remorses/egaki',
-  'https://github.com/remorses/termcast',
-  'https://github.com/remorses/goke',
-  'https://github.com/remorses/spiceflow',
-  'https://github.com/remorses/holocron',
-  'https://github.com/remorses/lintcn',
-  'https://github.com/remorses/usecomputer',
+  // All synced skills disabled per user request — only local skills kept.
+  // Re-enable by uncommenting the desired source:
+  // 'https://github.com/remorses/playwriter',
+  // 'https://github.com/remorses/tuistory',
+  // 'https://github.com/remorses/zele',
+  // 'https://github.com/remorses/critique',
+  // 'https://github.com/remorses/errore',
+  // 'https://github.com/remorses/egaki',
+  // 'https://github.com/remorses/termcast',
+  // 'https://github.com/remorses/goke',
+  // 'https://github.com/remorses/spiceflow',
+  // 'https://github.com/remorses/holocron',
+  // 'https://github.com/remorses/lintcn',
+  // 'https://github.com/remorses/usecomputer',
   // 'https://github.com/remorses/gitchamber',
-  'https://github.com/remorses/profano',
-  'https://github.com/remorses/sigillo',
-  'https://github.com/remorses/strada',
+  // 'https://github.com/remorses/profano',
+  // 'https://github.com/remorses/sigillo',
+  // 'https://github.com/remorses/strada',
 ]
 
 // Directories to skip during recursive SKILL.md search
