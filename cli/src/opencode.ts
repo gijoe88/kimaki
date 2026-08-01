@@ -859,7 +859,7 @@ async function startSingleServer({
         OPENCODE_PORT: port.toString(),
         KIMAKI: '1',
         OPENCODE_EXPERIMENTAL_WORKSPACES: 'true',
-        OPENCODE_ENABLE_EXA: '1',
+        OPENCODE_ENABLE_EXA: process.env.OPENCODE_ENABLE_EXA ?? '0',
         KIMAKI_DATA_DIR: getDataDir(),
         KIMAKI_LOCK_PORT: getLockPort().toString(),
         KIMAKI_PARENT_LOCK_PORT: getLockPort().toString(),
